@@ -1,9 +1,19 @@
-// main/main.c —— FoloToy AI Passport BSP 驱动参考示例:初始化 + 菜单 + 按键分发。
+// main/main.c —— FoloToy AI Passport「TotpPassport」固件入口。
+//
+// 与上游 BSP 参考示例的差别：上游首页是一排 BSP 自检 demo（Display/Button/
+// Audio/Battery/Wi-Fi/BLE/Low Power），那是给开发者验证硬件用的。TotpPassport
+// 是面向使用者的成品玩法，那些自检项不该出现在正常路径上。
+//
+// 本文件的做法：
+//   正常路径 —— 首页只有一张 TOTP 卡片，按 OK 直接进玩法；
+//   自检入口 —— 长按 OK 从玩法页回到首页后，再长按 OK 进入 BSP 自检菜单。
+//                自检代码一行未删，只是不再挡在用户和玩法之间。
 //
 // 按键语义(全局统一):
 //   上/下 短按   菜单中=移动选中项;演示页中=该页自定义
 //   确定  短按   菜单中=进入选中项;演示页中=该页自定义
 //   确定  长按   演示页中=返回菜单(由本文件统一拦截)
+//                首页长按=进入 BSP 自检菜单
 #include "bsp_i2c.h"
 #include "bsp_display.h"
 #include "bsp_button.h"
@@ -24,7 +34,15 @@
 
 static const char *TAG = "main";
 
-static const demo_entry_t DEMOS[] = {
+// 用户可见的玩法列表：只留 TOTP。
+static const demo_entry_t PLAYS[] = {
+    { .name = "TOTP", .enter = demo_totp_enter, .exit = demo_totp_exit,
+      .key = demo_totp_key, .start = demo_totp_start, .stop = demo_totp_stop },
+};
+#define PLAY_COUNT (sizeof(PLAYS) / sizeof(PLAYS[0]))
+
+// BSP 自检列表：仅在首页长按 OK 后可见，正常路径不暴露。
+static const demo_entry_t BSP_DEMOS[] = {
     { .name = "Display", .enter = demo_display_enter, .exit = demo_display_exit,
       .key = demo_display_key },
     { .name = "Button", .enter = demo_button_enter, .exit = demo_button_exit,
@@ -39,10 +57,15 @@ static const demo_entry_t DEMOS[] = {
       .key = demo_ble_key, .start = demo_ble_start, .stop = demo_ble_stop },
     { .name = "Low Power", .enter = demo_low_power_enter, .exit = demo_low_power_exit,
       .key = demo_low_power_key, .start = demo_low_power_start, .stop = demo_low_power_stop },
-    { .name = "TOTP", .enter = demo_totp_enter, .exit = demo_totp_exit,
-      .key = demo_totp_key, .start = demo_totp_start, .stop = demo_totp_stop },
 };
-#define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
+#define BSP_DEMO_COUNT (sizeof(BSP_DEMOS) / sizeof(BSP_DEMOS[0]))
+
+// 当前生效的列表（指向 PLAYS 或 BSP_DEMOS）。导航只认指针，不关心是哪一张表。
+static const demo_entry_t *s_list;
+static size_t s_list_count;
+
+// 自检页是否已初始化：自检里的外设会重新 init，不能开机就跑。
+static bool s_bsp_inited;
 #define INPUT_QUEUE_DEPTH 8
 
 typedef struct {
@@ -51,21 +74,27 @@ typedef struct {
 } input_event_t;
 
 // 各外设初始化结果:失败的项在菜单里标 [FAIL] 且不允许进入。
-static bool s_ok[DEMO_COUNT];
+// 只给 BSP 自检表用；玩法首页只有 TOTP 一项，无需判定。
+static bool s_ok[BSP_DEMO_COUNT > PLAY_COUNT ? BSP_DEMO_COUNT : PLAY_COUNT];
 
 static lv_obj_t *s_menu_scr;
-static lv_obj_t *s_cards[DEMO_COUNT];
-static lv_obj_t *s_rows[DEMO_COUNT];
+static lv_obj_t *s_cards[BSP_DEMO_COUNT > PLAY_COUNT ? BSP_DEMO_COUNT : PLAY_COUNT];
+static lv_obj_t *s_rows[BSP_DEMO_COUNT > PLAY_COUNT ? BSP_DEMO_COUNT : PLAY_COUNT];
 static lv_obj_t *s_mascot;
+static lv_obj_t *s_hint;             // 玩法首页副标题
+static lv_obj_t *s_hint2;            // 玩法首页操作提示
 static demo_navigation_t s_navigation;
+
+// 项目字库（含中文），见 tools/gen_totp_font.py 与 assets/fonts/
+extern const lv_font_t font_totp_16;
 static QueueHandle_t s_input_queue;
 static TaskHandle_t s_input_task;
 static volatile bool s_input_ready;
 
 static void menu_refresh(void) {
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
+    for (size_t i = 0; i < s_list_count; i++) {
         lv_label_set_text_fmt(s_rows[i], "%s%s",
-                              DEMOS[i].name,
+                              s_list[i].name,
                               s_ok[i] ? "" : "  [FAIL]");
         ui_pixel_set_selected(s_cards[i], i == s_navigation.selected, s_ok[i]);
         lv_obj_set_style_text_color(s_rows[i],
@@ -73,20 +102,53 @@ static void menu_refresh(void) {
     }
 }
 
+// 玩法首页：一张大卡 + 一行玩法标题。开机就停在这一屏。
+// s_list 指向 BSP_DEMOS 时才画成自检用的双列格子。
 static void menu_build(void) {
-    s_menu_scr = ui_pixel_screen_create("FoloToy");
+    const bool bsp_mode = (s_list == BSP_DEMOS);
+    // 标题牌用 montserrat_20，没有中文字形 —— 自检模式标题保持英文。
+    s_menu_scr = ui_pixel_screen_create(bsp_mode ? "BSP Check" : "TotpPassport");
 
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        int x = 11 + (int)(i % 2) * 112;
-        int y = 52 + (int)(i / 2) * 47;
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 40, UI_PAPER);
-        s_rows[i] = lv_label_create(s_cards[i]);
-        lv_obj_set_style_text_font(s_rows[i], &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_center(s_rows[i]);
+    if (bsp_mode) {
+        // 自检菜单保留上游的双列格子，方便开发者逐项验证外设。
+        for (size_t i = 0; i < s_list_count; i++) {
+            int x = 11 + (int)(i % 2) * 112;
+            int y = 52 + (int)(i / 2) * 47;
+            s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 40, UI_PAPER);
+            s_rows[i] = lv_label_create(s_cards[i]);
+            lv_obj_set_style_text_font(s_rows[i], &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_center(s_rows[i]);
+        }
+        s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 242);
+    } else {
+        // 玩法首页：一张居中的大卡片，按 OK 直接进。
+        s_cards[0] = ui_pixel_panel_create(s_menu_scr, 24, 96, 192, 76, UI_PAPER);
+        s_rows[0] = lv_label_create(s_cards[0]);
+        lv_obj_set_style_text_font(s_rows[0], &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_align(s_rows[0], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(s_rows[0]);
+
+        s_hint = lv_label_create(s_menu_scr);
+        // 必须用项目的 font_totp_16：lv_font_montserrat_14 没有中文字形，
+        // 中文会渲染成空白方块。
+        lv_obj_set_style_text_font(s_hint, &font_totp_16, 0);
+        lv_obj_set_style_text_color(s_hint, lv_color_hex(UI_INK), 0);
+        lv_obj_set_style_text_align(s_hint, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(s_hint, "离线两步验证码");
+        lv_obj_set_width(s_hint, 200);
+        lv_obj_set_pos(s_hint, 20, 186);
+
+        s_hint2 = lv_label_create(s_menu_scr);
+        lv_obj_set_style_text_font(s_hint2, &font_totp_16, 0);
+        lv_obj_set_style_text_color(s_hint2, lv_color_hex(UI_SKY_DARK), 0);
+        lv_obj_set_style_text_align(s_hint2, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(s_hint2, "按 OK 进入");
+        lv_obj_set_width(s_hint2, 200);
+        lv_obj_set_pos(s_hint2, 20, 210);
+
+        s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 246);
     }
-
-    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 242);
 
     menu_refresh();
     lv_screen_load(s_menu_scr);
@@ -105,12 +167,45 @@ static demo_nav_input_t navigation_input(bsp_btn_t btn, bsp_btn_ev_t event) {
     return DEMO_NAV_INPUT_OTHER;
 }
 
+// 自检表里那些外设要在这里才 init（不在 app_main 里）。
+// 玩法路径完全不碰它们 —— 开机不测音频蓝牙，省电也不扰民。
+static void bsp_self_test_init(void) {
+    if (s_bsp_inited) return;
+    s_bsp_inited = true;
+    s_ok[1] = (bsp_audio_init() == ESP_OK);
+    s_ok[2] = (bsp_battery_init() == ESP_OK);
+    s_ok[3] = true;                // Wi-Fi / BLE / Low Power 在页内按需初始化
+    s_ok[4] = true;
+    s_ok[5] = true;
+    ESP_LOGI(TAG, "BSP 自检已启用（Audio=%d Battery=%d）", s_ok[1], s_ok[2]);
+}
+
+// 在首页长按 OK：切入 BSP 自检菜单。返回 true 表示已切换，调用方应停止本次处理。
+static bool enter_bsp_menu(void) {
+    s_list = BSP_DEMOS;
+    s_list_count = BSP_DEMO_COUNT;
+    bsp_self_test_init();
+    if (!bsp_lvgl_lock(1000)) return false;
+    demo_navigation_init(&s_navigation, s_list_count);
+    if (s_menu_scr) {
+        lv_obj_delete(s_menu_scr);
+        s_menu_scr = NULL;
+    }
+    s_mascot = NULL;
+    s_hint = NULL;
+    s_hint2 = NULL;
+    menu_build();
+    bsp_lvgl_unlock();
+    ESP_LOGI(TAG, "已进入 BSP 自检菜单");
+    return true;
+}
+
 static void process_input(const input_event_t *input) {
     demo_nav_input_t nav_input = navigation_input(input->btn, input->event);
 
     if (s_navigation.active >= 0) {
         demo_nav_result_t result = demo_navigation_handle(&s_navigation, nav_input, true);
-        const demo_entry_t *demo = &DEMOS[result.index];
+        const demo_entry_t *demo = &s_list[result.index];
         if (result.action == DEMO_NAV_ACTION_EXIT) {
             esp_err_t e = demo->stop ? demo->stop() : ESP_OK;
             if (e != ESP_OK) {
@@ -128,7 +223,12 @@ static void process_input(const input_event_t *input) {
         return;
     }
 
-    if (nav_input == DEMO_NAV_INPUT_OTHER || nav_input == DEMO_NAV_INPUT_OK_LONG) return;
+    // 首页长按 OK → 切到 BSP 自检菜单（正常玩法路径不暴露自检）
+    if (nav_input == DEMO_NAV_INPUT_OK_LONG) {
+        if (enter_bsp_menu()) return;
+        return;
+    }
+    if (nav_input == DEMO_NAV_INPUT_OTHER) return;
     if (!bsp_lvgl_lock(500)) return;
     demo_nav_result_t result = demo_navigation_handle(
         &s_navigation, nav_input, s_ok[s_navigation.selected]);
@@ -136,11 +236,13 @@ static void process_input(const input_event_t *input) {
         menu_refresh();
         ui_pixel_mascot_jump(s_mascot);
     } else if (result.action == DEMO_NAV_ACTION_ENTER) {
-        const demo_entry_t *demo = &DEMOS[result.index];
+        const demo_entry_t *demo = &s_list[result.index];
         ui_pixel_mascot_jump(s_mascot);
         lv_obj_delete(s_menu_scr);
         s_menu_scr = NULL;
         s_mascot = NULL;
+        s_hint = NULL;
+        s_hint2 = NULL;
         demo->enter();
         bsp_lvgl_unlock();
 
@@ -241,9 +343,10 @@ void app_main(void) {
     }
     bsp_display_backlight(100);
 
-    demo_navigation_init(&s_navigation, DEMO_COUNT);
+    demo_navigation_init(&s_navigation, PLAY_COUNT);
 
-    // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
+    // 开机只做玩法路径必需的初始化：显示与按键。
+    // 音频/电池等自检外设留给首页长按 OK 后再开（见 bsp_self_test_init）。
     s_ok[0] = true;                                   // Display 已确认可用
     esp_err_t input_err = input_dispatch_init();
     esp_err_t button_err = input_err == ESP_OK
@@ -264,18 +367,15 @@ void app_main(void) {
             ESP_LOGI(TAG, "唤醒键在按键驱动启动前已松手,提前撤防");
         }
     }
-    s_ok[2] = (bsp_audio_init() == ESP_OK);
-    s_ok[3] = (bsp_battery_init() == ESP_OK);
-    s_ok[4] = true;                                    // 页面内按需初始化并显示错误
-    s_ok[5] = true;
-    s_ok[6] = true;
 
     if (bsp_lvgl_lock(1000)) {
+        s_list = PLAYS;
+        s_list_count = PLAY_COUNT;
         enter_menu();
         bsp_lvgl_unlock();
         s_input_ready = true;
     }
 
-    ESP_LOGI(TAG, "就绪:Display=%d Button=%d Audio=%d Battery=%d",
-             s_ok[0], s_ok[1], s_ok[2], s_ok[3]);
+    ESP_LOGI(TAG, "TotpPassport 就绪：Display=%d Button=%d（BSP 自检项需长按 OK 进入）",
+             s_ok[0], s_ok[1]);
 }
