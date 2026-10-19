@@ -1,6 +1,10 @@
 MIT License
 
+TotpPassport (ai-passport-totp)
 Copyright (c) 2026 sshnuke3
+
+Derived from FoloToy ai-passport
+Copyright (c) 2026 FoloToy
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
